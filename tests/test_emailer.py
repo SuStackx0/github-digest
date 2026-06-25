@@ -49,7 +49,7 @@ def test_send_digest_calls_resend():
                 send_digest(repos=MOCK_REPOS, reports=reports)
         mock_send.assert_called_once()
         call_args = mock_send.call_args[0][0]
-        assert call_args["to"] == ["gsumanthg2003@gmail.com"]
+        assert call_args["to"] == ["gs703880@gmail.com"]
         assert "GitHub Trending Digest" in call_args["subject"]
     finally:
         os.unlink(tmp_path)

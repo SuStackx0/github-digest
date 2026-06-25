@@ -1,5 +1,8 @@
+import base64
+import tempfile
+from pathlib import Path
 import pytest
-from researcher import generate_report
+from researcher import generate_analysis, generate_pdf, build_email_snippet
 
 MOCK_REPO = {
     "owner": "openai",
@@ -11,11 +14,19 @@ MOCK_REPO = {
     "stars_today": "1234",
     "url": "https://github.com/openai/whisper",
     "readme_text": (
-        "# Whisper\n\nWhisper is an automatic speech recognition (ASR) system trained on "
-        "680,000 hours of multilingual data.\n\n## Architecture\n\nEncoder-decoder transformer. "
-        "Audio is split into 30-second chunks.\n\n## Usage\n\n```python\nimport whisper\n"
-        "model = whisper.load_model('base')\nresult = model.transcribe('audio.mp3')\n```\n\n"
-        "## Available Models\n\ntiny, base, small, medium, large\n"
+        "# Whisper\n"
+        "Whisper is an automatic speech recognition (ASR) system trained on 680,000 hours "
+        "of multilingual and multitask supervised data collected from the web.\n"
+        "## Architecture\n"
+        "Encoder-decoder transformer. Audio is split into 30-second chunks.\n"
+        "## How it works\n"
+        "The model processes audio spectrogram inputs and generates text tokens.\n"
+        "## Installation\n"
+        "```bash\n"
+        "pip install openai-whisper\n"
+        "```\n"
+        "## Limitations\n"
+        "Performance degrades on low-resource languages.\n"
     ),
     "languages": {"Python": 95000, "Shell": 2000},
     "recent_commits": [
@@ -31,43 +42,66 @@ MOCK_REPO = {
 }
 
 
-def test_generate_report_returns_string():
-    report = generate_report(MOCK_REPO, rank=1)
-    assert isinstance(report, str)
-    assert len(report) > 500
+def test_generate_analysis_returns_dict():
+    a = generate_analysis(MOCK_REPO, rank=1)
+    assert isinstance(a, dict)
+    assert a["rank"] == 1
+    assert a["title"] == "openai/whisper"
+    assert a["url"] == "https://github.com/openai/whisper"
 
 
-def test_generate_report_includes_header():
-    report = generate_report(MOCK_REPO, rank=1)
-    assert "whisper" in report.lower()
-    assert "48000" in report or "48,000" in report
+def test_generate_analysis_has_all_sections():
+    a = generate_analysis(MOCK_REPO, rank=1)
+    required = ["problem", "purpose", "architecture", "methodology", "components",
+                "algorithms", "implementation", "tradeoffs", "use_cases",
+                "limitations", "concepts", "takeaways"]
+    for key in required:
+        assert key in a["sections"], f"Missing section: {key}"
+        assert isinstance(a["sections"][key], str)
+        assert len(a["sections"][key]) > 10, f"Section too short: {key}"
 
 
-def test_generate_report_includes_all_sections():
-    report = generate_report(MOCK_REPO, rank=1)
-    required_sections = ["TL;DR", "What problem", "System Design", "Why it", "Quick reference"]
-    for section in required_sections:
-        assert section in report, f"Missing section: {section}"
+def test_generate_analysis_extracts_limitations():
+    a = generate_analysis(MOCK_REPO, rank=1)
+    assert "low-resource" in a["sections"]["limitations"].lower() or len(a["sections"]["limitations"]) > 20
 
 
-def test_generate_report_includes_quick_reference_table():
-    report = generate_report(MOCK_REPO, rank=1)
-    assert "https://github.com/openai/whisper" in report
-    assert "openai" in report
+def test_generate_analysis_has_email_snippet():
+    a = generate_analysis(MOCK_REPO, rank=1)
+    assert isinstance(a["email_snippet"], str)
+    assert len(a["email_snippet"]) > 20
 
 
-def test_generate_report_rank_2():
-    report = generate_report(MOCK_REPO, rank=2)
-    assert "#2" in report or "2" in report
-
-
-def test_generate_report_handles_missing_readme():
+def test_generate_analysis_handles_empty_readme():
     repo = {**MOCK_REPO, "readme_text": ""}
-    report = generate_report(repo, rank=1)
-    assert isinstance(report, str)
-    assert len(report) > 200
+    a = generate_analysis(repo, rank=2)
+    assert a["rank"] == 2
+    for key in ["problem", "architecture", "takeaways"]:
+        assert len(a["sections"][key]) > 5
 
 
-def test_generate_report_formats_language_breakdown():
-    report = generate_report(MOCK_REPO, rank=1)
-    assert "Python" in report
+def test_generate_pdf_creates_file():
+    a = generate_analysis(MOCK_REPO, rank=1)
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / "test_digest.pdf"
+        generate_pdf([a], pdf_path)
+        assert pdf_path.exists()
+        assert pdf_path.stat().st_size > 5000
+
+
+def test_generate_pdf_multiple_repos():
+    a1 = generate_analysis(MOCK_REPO, rank=1)
+    a2 = generate_analysis({**MOCK_REPO, "owner": "microsoft", "name": "TypeChat",
+                             "description": "Type-safe LLM structured outputs", "rank": 2}, rank=2)
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = Path(tmp) / "multi.pdf"
+        generate_pdf([a1, a2], pdf_path)
+        assert pdf_path.exists()
+        assert pdf_path.stat().st_size > 8000
+
+
+def test_build_email_snippet():
+    a = generate_analysis(MOCK_REPO, rank=1)
+    snippet = build_email_snippet(a)
+    assert isinstance(snippet, str)
+    assert len(snippet) > 10

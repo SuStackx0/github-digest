@@ -1,15 +1,13 @@
 import logging
-import textwrap
+import re
+from pathlib import Path
+
+from fpdf import FPDF
 
 log = logging.getLogger(__name__)
 
-_README_MAX_CHARS = 8000
-
-
-def _excerpt_readme(readme: str, max_chars: int = _README_MAX_CHARS) -> str:
-    if not readme:
-        return ""
-    return readme[:max_chars] + ("..." if len(readme) > max_chars else "")
+_README_MAX_CHARS = 10000
+_SECTION_MAX_CHARS = 1200
 
 
 def _format_number(n) -> str:
@@ -19,194 +17,330 @@ def _format_number(n) -> str:
         return str(n)
 
 
+def _strip_markdown(text: str) -> str:
+    text = re.sub(r'```.*?```', '[code omitted]', text, flags=re.DOTALL)
+    text = re.sub(r'`[^`]+`', lambda m: m.group()[1:-1], text)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
+    text = re.sub(r'_{1,3}([^_]+)_{1,3}', r'\1', text)
+    text = re.sub(r'!\[([^\]]*)\]\([^)]+\)', '', text)
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'^[-*_]{3,}$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def _sanitize(text: str) -> str:
+    replacements = {
+        '—': '--', '–': '-', ''': "'", ''': "'",
+        '"': '"', '"': '"', '…': '...', '•': '-',
+        '·': '-', '★': '*', '❤': '<3', ' ': ' ',
+    }
+    for char, rep in replacements.items():
+        text = text.replace(char, rep)
+    return text.encode('latin-1', errors='replace').decode('latin-1')
+
+
+def _excerpt(readme: str) -> str:
+    return readme[:_README_MAX_CHARS] if readme else ""
+
+
+def _extract_section(readme: str, keywords: list, max_chars: int = _SECTION_MAX_CHARS) -> str:
+    if not readme:
+        return ""
+    lines = readme.splitlines()
+    result, in_section, section_level, chars = [], False, 0, 0
+    for line in lines:
+        m = re.match(r'^(#{1,6})\s+(.+)', line)
+        if m:
+            level = len(m.group(1))
+            heading = m.group(2).lower()
+            if in_section and level <= section_level:
+                break
+            if any(kw in heading for kw in keywords):
+                in_section, section_level = True, level
+                continue
+        elif in_section:
+            result.append(line)
+            chars += len(line)
+            if chars >= max_chars:
+                break
+    content = _strip_markdown("\n".join(result)).strip()
+    return content[:max_chars] if content else ""
+
+
+def _first_real_paragraph(readme: str, min_len: int = 60) -> str:
+    if not readme:
+        return ""
+    for line in readme.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith('#') and not stripped.startswith('!') and len(stripped) >= min_len:
+            return _strip_markdown(stripped)[:400]
+    return ""
+
+
+def _extract_code_example(readme: str) -> str:
+    if not readme:
+        return ""
+    m = re.search(r'```[a-zA-Z]*\n(.*?)```', readme, re.DOTALL)
+    if m:
+        code = m.group(1).strip()
+        lines = code.splitlines()[:10]
+        return "\n".join(lines)
+    return ""
+
+
 def _language_breakdown(languages: dict) -> str:
     if not languages:
         return "Not specified"
     total = sum(languages.values()) or 1
-    parts = [f"{lang} ({bytes_count / total * 100:.0f}%)" for lang, bytes_count in
-             sorted(languages.items(), key=lambda x: -x[1])[:5]]
+    parts = [f"{lang} ({v/total*100:.0f}%)" for lang, v in sorted(languages.items(), key=lambda x: -x[1])[:4]]
     return ", ".join(parts)
 
 
-def _extract_usage_example(readme: str) -> str:
-    if not readme:
-        return ""
-    in_block = False
-    lines = []
-    for line in readme.splitlines():
-        if line.strip().startswith("```") and not in_block:
-            in_block = True
-            continue
-        if line.strip().startswith("```") and in_block:
-            break
-        if in_block:
-            lines.append(line)
-    if lines:
-        return "\n".join(lines[:12])
-    return ""
+def _infer_tradeoffs(repo: dict, readme: str) -> str:
+    content = _extract_section(readme, ["tradeoff", "limitation", "caveat", "drawback", "consider", "decision"])
+    if content:
+        return content
+    lang = repo.get('language', 'the chosen language')
+    desc = repo.get('description', '')
+    return (
+        f"The project prioritises {desc.lower()[:80] if desc else 'its stated goal'} "
+        f"over generality, a deliberate scope constraint common in focused open-source tools. "
+        f"Choosing {lang} signals a trade-off favouring developer ergonomics or ecosystem access "
+        f"over maximum runtime performance."
+    )
 
 
-def _derive_architecture(readme: str, repo: dict) -> str:
-    if not readme:
-        return "Architecture details not available — README not found."
-    headings = [line.lstrip("#").strip() for line in readme.splitlines()
-                if line.startswith("#") and len(line) > 3]
-    arch_keywords = ["architecture", "design", "how it works", "overview", "system", "pipeline",
-                     "model", "backend", "frontend", "components", "structure"]
-    relevant = [h for h in headings if any(k in h.lower() for k in arch_keywords)]
-    if relevant:
-        return f"Key structural sections in the README: {', '.join(relevant[:5])}."
-    return f"Built in {repo.get('language', 'multiple languages')} — see README for full architecture."
-
-
-def _infer_tldr(repo: dict) -> str:
-    name = repo.get("name", "unknown")
-    owner = repo.get("owner", "")
-    desc = repo.get("description", "").rstrip(".")
-    stars_today = _format_number(repo.get("stars_today", "0"))
-    language = repo.get("language", "")
-    topics = repo.get("api_data", {}).get("topics", [])
-    topic_str = f" It covers {', '.join(topics[:3])}." if topics else ""
-
-    readme = repo.get("readme_text", "")
-    first_para = ""
+def _infer_concepts(repo: dict, readme: str) -> str:
+    topics = repo.get('api_data', {}).get('topics', [])
+    lang = repo.get('language', '')
+    desc = repo.get('description', '')
+    base = f"Core concepts: {', '.join(topics[:6])}." if topics else f"Core domain: {desc[:100]}."
+    base += f" Language used: {lang}."
     if readme:
-        for line in readme.splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#") and len(stripped) > 40:
-                first_para = stripped[:200]
-                break
-
-    tldr = f"**{owner}/{name}** — {desc}."
-    if first_para:
-        tldr += f" {first_para}"
-    tldr += f"{topic_str} It gained {stars_today} stars today, signaling strong community interest."
-    if language:
-        tldr += f" Written in {language}."
-    return tldr
+        headings = [re.match(r'^#{1,6}\s+(.+)', l) for l in readme.splitlines()]
+        headings = [m.group(1) for m in headings if m]
+        if headings:
+            base += f" Key sections in the README: {', '.join(headings[:6])}."
+    return base
 
 
-def _infer_problem(repo: dict) -> str:
-    desc = repo.get("description", "")
-    readme = repo.get("readme_text", "")
-    name = repo.get("name", "")
-
-    if readme:
-        for line in readme.splitlines():
-            stripped = line.strip()
-            if any(kw in stripped.lower() for kw in
-                   ["problem", "motivation", "why", "pain", "challenge", "solves"]):
-                return stripped[:400]
-
-    return (f"{name.capitalize()} addresses the challenge of {desc.lower() or 'the problem described in the repo'}. "
-            f"Engineers dealing with this space will find it directly applicable.")
-
-
-def _infer_why_interesting(repo: dict) -> str:
-    stars_today = _format_number(repo.get("stars_today", "0"))
-    total_stars = _format_number(repo.get("total_stars", "0"))
-    commits = repo.get("recent_commits", [])
-    recent_msg = commits[0]["commit"]["message"].split("\n")[0] if commits else ""
-    topics = repo.get("api_data", {}).get("topics", [])
-
-    insight = (f"The repo pulled {stars_today} new stars in a single day against a base of "
-               f"{total_stars} total — an unusually high velocity ratio.")
-    if recent_msg:
-        insight += f" The most recent commit ({recent_msg!r}) suggests active development."
-    if topics:
-        insight += f" Topics ({', '.join(topics[:4])}) place it squarely in a high-interest space right now."
-    return insight
+def _infer_takeaways(repo: dict, readme: str) -> str:
+    lang = repo.get('language', 'the project language')
+    stars_today = _format_number(repo.get('stars_today', '0'))
+    desc = repo.get('description', '')
+    code_example = _extract_code_example(readme)
+    takeaway = (
+        f"This repository demonstrates how to build {desc.lower()[:100] if desc else 'a focused tool'} "
+        f"in {lang}. Its rapid growth ({stars_today} stars today) shows strong demand in this space. "
+        f"Study how the project structures its public API and README for clarity — these patterns "
+        f"transfer directly to your own projects."
+    )
+    if code_example:
+        takeaway += f"\n\nThe minimal usage pattern illustrates the intended developer experience:\n{code_example[:300]}"
+    return takeaway
 
 
-def generate_report(repo: dict, rank: int) -> str:
-    owner = repo.get("owner", "unknown")
-    name = repo.get("name", "unknown")
-    description = repo.get("description", "No description provided")
-    language = repo.get("language", "Unknown")
-    total_stars = _format_number(repo.get("total_stars", "0"))
-    forks = _format_number(repo.get("forks", "0"))
-    stars_today = _format_number(repo.get("stars_today", "0"))
-    url = repo.get("url", f"https://github.com/{owner}/{name}")
-    readme = _excerpt_readme(repo.get("readme_text", ""))
-    languages = repo.get("languages", {})
-    api_data = repo.get("api_data", {})
+def generate_analysis(repo: dict, rank: int) -> dict:
+    owner = repo.get('owner', 'unknown')
+    name = repo.get('name', 'unknown')
+    description = repo.get('description', 'No description available')
+    language = repo.get('language', 'Unknown')
+    total_stars = _format_number(repo.get('total_stars', '0'))
+    stars_today = _format_number(repo.get('stars_today', '0'))
+    forks = _format_number(repo.get('forks', '0'))
+    url = repo.get('url', f'https://github.com/{owner}/{name}')
+    readme = _excerpt(repo.get('readme_text', ''))
+    languages = repo.get('languages', {})
+    api_data = repo.get('api_data', {})
+    topics = api_data.get('topics', [])
+    license_name = (api_data.get('license', {}) or {}).get('name', 'Not specified')
+    open_issues = api_data.get('open_issues_count', 'N/A')
+    commits = repo.get('recent_commits', [])
+    recent_commit = commits[0]['commit']['message'].split('\n')[0] if commits else ''
 
-    license_name = (api_data.get("license", {}).get("name", "Not specified")
-                    if api_data.get("license") else "Not specified")
-    open_issues = api_data.get("open_issues_count", "N/A")
-    usage_example = _extract_usage_example(readme)
-    arch_note = _derive_architecture(readme, repo)
+    first_para = _first_real_paragraph(readme)
     lang_breakdown = _language_breakdown(languages)
 
-    usage_block = ""
-    if usage_example:
-        usage_block = f"""
-### Usage example
+    problem = (
+        _extract_section(readme, ['problem', 'motivation', 'why', 'background', 'challenge', 'pain']) or
+        f"{description}. This addresses a recurring pain point for developers working in this space."
+    )
 
-```
-{usage_example}
-```
-"""
+    purpose = (
+        _extract_section(readme, ['purpose', 'goal', 'objective', 'about', 'introduction', 'what is']) or
+        (first_para if first_para else description)
+    )
 
-    issues_note = ("active maintenance" if isinstance(open_issues, int) and open_issues > 0
-                   else "early-stage or stable project")
+    architecture = (
+        _extract_section(readme, ['architecture', 'design', 'overview', 'how it works', 'system', 'structure']) or
+        f"Built in {language} ({lang_breakdown}). "
+        + (f"Key topics: {', '.join(topics[:5])}." if topics else "See README for architecture details.")
+    )
 
-    report = textwrap.dedent(f"""        # {name} — {description}
+    methodology = (
+        _extract_section(readme, ['approach', 'method', 'algorithm', 'technique', 'strategy', 'pipeline', 'workflow']) or
+        f"The project follows a {language}-based approach. "
+        + (f"It focuses on {description.lower()[:120]}." if description else "")
+    )
 
-        ⭐ {total_stars} stars | 🍴 {forks} forks | {language} | 🔥 #{rank} trending today ({stars_today} new stars)
+    components = (
+        _extract_section(readme, ['component', 'module', 'part', 'structure', 'layout', 'folder', 'directory']) or
+        f"The codebase is written in {language}. Language breakdown: {lang_breakdown}. "
+        "Consult the repository structure for individual modules."
+    )
 
-        ---
+    algorithms = (
+        _extract_section(readme, ['algorithm', 'pattern', 'technique', 'model', 'method', 'implementation', 'core']) or
+        f"The project implements {description.lower()[:120] if description else 'the described functionality'}. "
+        + (f"Topics tagged: {', '.join(topics[:5])}." if topics else "")
+    )
 
-        ## TL;DR
+    implementation = (
+        f"Language: {language}. Language breakdown: {lang_breakdown}.\n"
+        f"Total stars: {total_stars}. Forks: {forks}. Open issues: {open_issues}. License: {license_name}.\n"
+        + (f"Most recent commit: '{recent_commit}'." if recent_commit else "")
+        + ("\n" + _extract_section(readme, ['install', 'usage', 'getting started', 'quick start', 'setup'], 800) or "")
+    )
 
-        {_infer_tldr(repo)}
+    tradeoffs = _infer_tradeoffs(repo, readme)
 
-        ---
+    use_cases = (
+        _extract_section(readme, ['use case', 'example', 'usage', 'applications', 'who', 'demo', 'scenario']) or
+        f"{description}. Applicable wherever developers need to {description.lower()[:100] if description else 'address this problem'}."
+    )
 
-        ## What problem does it solve?
+    limitations = (
+        _extract_section(readme, ['limitation', 'known issue', 'caveat', 'not supported', 'todo', 'roadmap']) or
+        "No explicit limitations documented in the README. Check open issues on GitHub for known constraints."
+    )
 
-        {_infer_problem(repo)}
+    concepts = _infer_concepts(repo, readme)
+    takeaways = _infer_takeaways(repo, readme)
 
-        ---
+    first_line = first_para or description
+    email_snippet = f"{first_line[:180].rstrip('.')}." if first_line else description
+    if len(email_snippet) < 80 and description and description not in email_snippet:
+        email_snippet = f"{description.rstrip('.')}. {email_snippet}"
 
-        ## How it works — System Design
+    return {
+        'rank': rank,
+        'title': f"{owner}/{name}",
+        'url': url,
+        'description': description,
+        'language': language,
+        'total_stars': total_stars,
+        'stars_today': stars_today,
+        'forks': forks,
+        'license': license_name,
+        'open_issues': str(open_issues),
+        'email_snippet': email_snippet[:220],
+        'sections': {
+            'problem': problem,
+            'purpose': purpose,
+            'architecture': architecture,
+            'methodology': methodology,
+            'components': components,
+            'algorithms': algorithms,
+            'implementation': implementation,
+            'tradeoffs': tradeoffs,
+            'use_cases': use_cases,
+            'limitations': limitations,
+            'concepts': concepts,
+            'takeaways': takeaways,
+        },
+    }
 
-        ### Architecture overview
 
-        {arch_note}
+def build_email_snippet(analysis: dict) -> str:
+    return analysis.get('email_snippet', analysis.get('description', ''))
 
-        ### Key technical decisions
 
-        - **Language choice:** {language} — {lang_breakdown}
-        - **Scope:** {description}
-        - **Open issues:** {open_issues} — indicates {issues_note}
-        - **License:** {license_name}
+def generate_pdf(analyses: list, output_path) -> None:
+    SECTION_LABELS = [
+        ('problem',        '1. Problem Being Solved'),
+        ('purpose',        '2. Purpose and Motivation'),
+        ('architecture',   '3. High-Level Architecture and Design'),
+        ('methodology',    '4. Core Methodology and Approach'),
+        ('components',     '5. Important Components'),
+        ('algorithms',     '6. Key Algorithms, Patterns, and Techniques'),
+        ('implementation', '7. Important Implementation Details'),
+        ('tradeoffs',      '8. Trade-offs and Design Decisions'),
+        ('use_cases',      '9. Real-World Use Cases'),
+        ('limitations',    '10. Limitations'),
+        ('concepts',       '11. Key Concepts to Learn'),
+        ('takeaways',      '12. Practical Takeaways'),
+    ]
 
-        ### Tech stack
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.set_margins(20, 20, 20)
 
-        - Language: {language}
-        - Key frameworks / libraries: See README for full dependency list
-        - Language breakdown: {lang_breakdown}
-        {usage_block}
-        ---
+    # Cover page
+    pdf.add_page()
+    pdf.set_font('Helvetica', 'B', 20)
+    pdf.ln(30)
+    pdf.cell(0, 12, _sanitize('GitHub Trending Digest'), ln=True, align='C')
+    pdf.set_font('Helvetica', '', 12)
+    if analyses:
+        from datetime import datetime
+        pdf.cell(0, 8, _sanitize(datetime.now().strftime('%A, %B %-d, %Y')), ln=True, align='C')
+    pdf.ln(10)
+    pdf.set_font('Helvetica', '', 11)
+    pdf.cell(0, 7, _sanitize(f"Deep-dive analysis of {len(analyses)} trending repositories"), ln=True, align='C')
+    pdf.ln(20)
 
-        ## Why it's interesting
+    # TOC
+    pdf.set_font('Helvetica', 'B', 13)
+    pdf.cell(0, 9, 'Contents', ln=True)
+    pdf.set_font('Helvetica', '', 11)
+    pdf.ln(2)
+    for a in analyses:
+        pdf.cell(0, 7, _sanitize(f"  #{a['rank']}  {a['title']}  ({a['stars_today']} stars today)"), ln=True)
+    pdf.ln(10)
 
-        {_infer_why_interesting(repo)}
+    # Per-repo sections
+    for a in analyses:
+        pdf.add_page()
 
-        ---
+        # Repo header
+        pdf.set_font('Helvetica', 'B', 16)
+        pdf.cell(0, 10, _sanitize(f"#{a['rank']} -- {a['title']}"), ln=True)
+        pdf.set_font('Helvetica', '', 10)
+        pdf.set_text_color(80, 80, 80)
+        pdf.cell(0, 6, _sanitize(a['url']), ln=True)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+        pdf.set_font('Helvetica', '', 11)
+        meta_line = _sanitize(
+            f"Stars today: {a['stars_today']}  |  Total: {a['total_stars']}  |  "
+            f"Forks: {a['forks']}  |  Language: {a['language']}  |  License: {a['license']}"
+        )
+        pdf.multi_cell(0, 6, meta_line)
+        pdf.ln(4)
 
-        ## Quick reference
+        # Description
+        pdf.set_font('Helvetica', 'I', 11)
+        pdf.multi_cell(0, 6, _sanitize(a['description']))
+        pdf.ln(6)
 
-        | Field | Value |
-        |---|---|
-        | Repo | {url} |
-        | Stars today | {stars_today} |
-        | Total stars | {total_stars} |
-        | Language | {language} |
-        | Owner | {owner} |
-        | License | {license_name} |
-        | Open issues | {open_issues} |
-    """)
+        # 12 sections
+        for key, label in SECTION_LABELS:
+            content = a['sections'].get(key, '').strip()
+            if not content:
+                continue
 
-    return report
+            # Section heading
+            pdf.set_font('Helvetica', 'B', 12)
+            pdf.cell(0, 8, _sanitize(label), ln=True)
+
+            # Section body
+            pdf.set_font('Helvetica', '', 11)
+            pdf.multi_cell(0, 6, _sanitize(content))
+            pdf.ln(5)
+
+        pdf.ln(10)
+
+    pdf.output(str(output_path))

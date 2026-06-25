@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Daily GitHub Trending Digest
-Scrapes top 3 repos, generates skimmable markdown reports, emails them.
+Scrapes top 3 repos, generates a PDF deep-dive report, emails it.
 """
 
 import argparse
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -27,7 +28,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 from scraper import scrape_trending
-from researcher import generate_report
+from researcher import generate_analysis, generate_pdf
 from emailer import send_digest
 
 
@@ -41,26 +42,33 @@ def run() -> None:
         log.info(f"Scraped {len(repos)} repos")
     except Exception as e:
         log.error(f"Scraping failed: {e}")
-        send_digest(repos=[], reports=[], failed=True, error=str(e))
+        send_digest(repos=[], analyses=[], failed=True, error=str(e))
         sys.exit(1)
 
-    reports = []
+    analyses = []
     for i, repo in enumerate(repos, start=1):
         try:
-            path = output_dir / f"repo_{i}_{repo['owner']}_{repo['name']}.md"
-            content = generate_report(repo, rank=i)
-            path.write_text(content, encoding="utf-8")
-            reports.append({"path": path, "repo": repo})
-            log.info(f"Report written: {path.name}")
+            analysis = generate_analysis(repo, rank=i)
+            analyses.append(analysis)
+            log.info(f"Analysis ready: {analysis['title']}")
         except Exception as e:
-            log.error(f"Report generation failed for {repo['owner']}/{repo['name']}: {e}")
+            log.error(f"Analysis failed for {repo.get('owner')}/{repo.get('name')}: {e}")
 
-    if not reports:
-        log.error("No reports generated — aborting")
+    if not analyses:
+        log.error("No analyses generated — aborting")
+        sys.exit(1)
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    pdf_path = output_dir / f"github_digest_{date_str}.pdf"
+    try:
+        generate_pdf(analyses, pdf_path)
+        log.info(f"PDF written: {pdf_path.name}")
+    except Exception as e:
+        log.error(f"PDF generation failed: {e}")
         sys.exit(1)
 
     try:
-        send_digest(repos=repos, reports=reports)
+        send_digest(repos=repos, analyses=analyses, pdf_path=pdf_path)
         log.info("Digest email sent successfully")
     except Exception as e:
         log.error(f"Email sending failed: {e}")
